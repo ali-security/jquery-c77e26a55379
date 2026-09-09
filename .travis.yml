@@ -1,3 +1,57 @@
 language: node_js
+
+# Pinned because the default Travis image drifted well past this release era;
+# focal is the oldest dist still provisioned and still resolves node 0.10.
+dist: focal
+
 node_js:
 - '0.10'
+
+jobs:
+  include:
+    # jQuery 1.11.1's own `npm test` is the Grunt default task (lint, build,
+    # uglify, dist) - the QUnit modules under test/unit/ are browser-loaded via
+    # test/index.html and were run on TestSwarm, which no longer exists. This
+    # leg runs that same suite in headless Chrome so the unit tests actually
+    # execute: 800 tests / 6086 assertions across all 19 modules, against the
+    # dist/jquery.js this build produces.
+    - name: "Unit tests (QUnit in headless Chrome)"
+      node_js: '20'
+      addons:
+        chrome: stable
+      install:
+        # dist/ has to be built by the release-era toolchain: jQuery's 2014
+        # devDependencies (grunt 0.4) neither install nor run on node 20.
+        - nvm install 0.10
+        - nvm use 0.10
+        - npm install
+        - ./node_modules/.bin/grunt
+        # The puppeteer-core driver is test-only tooling that never ships in
+        # the artifact, so it is installed from the live registry and kept in
+        # its own tree - reifying jQuery's package.json under npm 10 would
+        # tear down the node 0.10 install above.
+        - nvm use 20
+        - (mkdir -p /tmp/driver && cd /tmp/driver && npm init -y && npm install puppeteer-core)
+      script:
+        # The ajax module exercises the test/data/*.php endpoints, so the suite
+        # needs a PHP-capable server. PHP_CLI_SERVER_WORKERS is load-bearing:
+        # single-process `php -S` serializes requests and starves the fixture
+        # iframe loads in two core tests.
+        - php -v || sudo apt-get install -y php-cli
+        - PHP_CLI_SERVER_WORKERS=10 php -S 127.0.0.1:8000 -t . > /tmp/php-server.log 2>&1 &
+        - sleep 5
+        - curl -sSf -o /dev/null http://127.0.0.1:8000/test/index.html
+        # Two tests are excluded as environment-dependent, de-registered by the
+        # runner at declaration time so test/unit/*.js stays pristine:
+        #   ajax: #14379 - jQuery.ajax() on unload
+        #     fires a synchronous XHR from a window unload handler; Chrome has
+        #     forbidden sync XHR during page dismissal since ~v80, so the
+        #     request never reaches the wire.
+        #   offset: fractions (see #7730 and #7885)
+        #     asserts a fractional offset round-trips exactly; Blink snaps to
+        #     1/64 px, reading 999.984375 back for 1000. Not DPI-dependent.
+        - >-
+          NODE_PATH=/tmp/driver/node_modules
+          SEAL_CHROME=/usr/bin/google-chrome
+          SEAL_SKIP_TESTS="ajax: #14379 - jQuery.ajax() on unload|offset: fractions (see #7730 and #7885)"
+          node test/seal-browser-runner.js "http://127.0.0.1:8000/test/index.html?dev"

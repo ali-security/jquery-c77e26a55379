@@ -1,0 +1,126 @@
+name: seal-build
+
+# Build-and-pack only. The jQuery 1.11.1 test suite runs on Travis, so this
+# workflow deliberately contains no test step.
+on: workflow_dispatch
+
+jobs:
+  build:
+    name: Build and pack jquery-1.11.1.tgz
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # The release process generates dist/cdn/* via makeReleaseCopies() in
+      # build/release.js, which is only reachable through the interactive
+      # `grunt release` task. This standalone reproduction of that function is
+      # written to RUNNER_TEMP - deliberately outside the checkout - because
+      # the version patch cannot carry paths under build/, and because any file
+      # left inside the tree would be packed into the tarball as an extra
+      # entry. It reads package.json from process.cwd() (which is /build in the
+      # container) rather than a path relative to its own location, since it no
+      # longer lives beside package.json.
+      - name: Stage the cdn-copies script outside the checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/seal"
+          cat > "$RUNNER_TEMP/seal/make-cdn-copies.js" <<'EOF'
+          // Standalone reproduction of makeReleaseCopies() from build/release.js
+          // Generates dist/cdn/* exactly as the jQuery release process does.
+          // Does NOT create the googlecdn/mscdn zip archives or md5 files.
+          var fs = require( "fs" );
+
+          var version = require( process.cwd() + "/package.json" ).version,
+            devFile = "dist/jquery.js",
+            minFile = "dist/jquery.min.js",
+            mapFile = "dist/jquery.min.map",
+            cdnFolder = "dist/cdn",
+            releaseFiles = {
+              "jquery-VER.js": devFile,
+              "jquery-VER.min.js": minFile,
+              "jquery-VER.min.map": mapFile,
+              "jquery.js": devFile,
+              "jquery.min.js": minFile,
+              "jquery.min.map": mapFile,
+              "jquery-latest.js": devFile,
+              "jquery-latest.min.js": minFile,
+              "jquery-latest.min.map": mapFile
+            };
+
+          if ( !fs.existsSync( cdnFolder ) ) {
+            fs.mkdirSync( cdnFolder );
+          }
+
+          Object.keys( releaseFiles ).forEach(function( key ) {
+            var text,
+              builtFile = releaseFiles[ key ],
+              unpathedFile = key.replace( /VER/g, version ),
+              releaseFile = cdnFolder + "/" + unpathedFile;
+
+            if ( /\.map$/.test( releaseFile ) ) {
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                  "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                  "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+              fs.writeFileSync( releaseFile, text );
+            } else if ( /\.min\.js$/.test( releaseFile ) ) {
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /\/\/# sourceMappingURL=\S+/, "" );
+              fs.writeFileSync( releaseFile, text );
+            } else if ( builtFile !== releaseFile ) {
+              fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+            }
+          });
+
+          console.log( "cdn copies created" );
+          EOF
+
+      # npm 2.x on Node 0.10 is what reproduces the published tarball's file
+      # set: a modern npm's `npm pack` omits `.npmignore`, which the reference
+      # tarball contains. COMMIT is intentionally left unset - `docker run`
+      # does not inherit the host environment, and the build task appends
+      # COMMIT to the embedded version string when it is present.
+      - name: Build and pack in node:0.10-wheezy
+        run: |
+          docker run --rm --platform linux/amd64 -v "$PWD":/build -v "$RUNNER_TEMP/seal":/seal -w /build node:0.10-wheezy bash -c '
+            set -e
+            npm config set registry https://time-machines-npm.sealsecurity.io/
+            npm config set //time-machines-npm.sealsecurity.io/:_authToken 2014-05-01T18:05:32.863000Z
+            npm config set always-auth true
+
+            # Pin the embedded build date so dist/jquery.js is reproducible:
+            # upstream stamps the current build time into the "Date:" header of
+            # the banner, which would differ on every run. This pin lives in
+            # the workflow rather than as a source edit because the version
+            # patch cannot carry paths under build/.
+            sed -i '\''s|( new Date() ).toISOString().replace( /:\\d+\\.\\d+Z$/, "Z" )|"2014-05-01T17:42Z"|'\'' build/tasks/build.js
+            grep -n "2014-05-01T17:42Z" build/tasks/build.js
+
+            npm install
+            ./node_modules/.bin/grunt
+            node /seal/make-cdn-copies.js
+
+            # .npmignore does not list .github, and npm 2.x has no default
+            # ignore rule for it either, so the workflow file would be packed
+            # into the tarball as an extra entry. Remove it before packing.
+            rm -rf .github
+
+            npm pack
+          '
+
+      # The container writes as root; reclaim ownership so upload-artifact can
+      # read the tarball.
+      - name: Reclaim ownership of container-written files
+        run: sudo chown -R "$USER" .
+
+      - name: List produced tarball
+        run: |
+          ls -l jquery-1.11.1.tgz && tar tzf jquery-1.11.1.tgz | head -20
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: jquery-tgz
+          path: jquery-1.11.1.tgz
+          if-no-files-found: error
