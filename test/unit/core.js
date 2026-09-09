@@ -1103,6 +1103,22 @@ test("jQuery.extend(Object, Object)", function() {
 	deepEqual( options2, options2Copy, "Check if not modified: options2 must not be modified" );
 });
 
+test("jQuery.extend( true, ... ) Object.prototype pollution", function() {
+	expect( 2 );
+
+	jQuery.extend( true, {}, JSON.parse( "{\"__proto__\": {\"devMode\": true}}" ) );
+	ok( !( "devMode" in {} ), "Object.prototype not polluted" );
+
+	// A leaked enumerable property on Object.prototype makes jQuery.isPlainObject
+	// reject every later payload, which would mask the nested case below
+	delete Object.prototype.devMode;
+
+	jQuery.extend( true, {}, JSON.parse( "{\"a\": {\"__proto__\": {\"devMode\": true}}}" ) );
+	ok( !( "devMode" in {} ), "Object.prototype not polluted through a nested object" );
+
+	delete Object.prototype.devMode;
+});
+
 test("jQuery.each(Object,Function)", function() {
 	expect( 23 );
 
